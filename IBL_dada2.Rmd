@@ -1,0 +1,201 @@
+---
+title: "dada2_Simone"
+output: html_document
+date: "2022-10-11"
+editor_options: 
+  chunk_output_type: console
+---
+
+## set working directory
+set up your working directory in which you place the directory with your raw FASTQ files.
+```{r, setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = '~/stage')
+```
+
+# Base 
+## create output directories
+```{r}
+setwd("~/stage/data")
+dir.create("workspaces")
+dir.create("results")
+```
+
+## Load packages
+```{r}
+library(seqinr)
+library(dada2)
+require(stringr)
+library(ggplot2)
+```
+
+## get files
+```{r}
+path <- "~/stage/data/raw_data"  #path to raw FASTQ files
+list.files(path)
+```
+
+## filtering
+Obtain list of forward and reverse reads by filtering based on file names. NOTE: make sure to end up witht he same names as used in the metadata for downstream analysis. 
+for the test data forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+```{r}
+#fnFs <- sort(list.files(path, pattern="_R1_001.fastq", full.names = TRUE))
+#fnRs <- sort(list.files(path, pattern="_R2_001.fastq", full.names = TRUE))
+
+fnFs <- sort(list.files(path, pattern="_L001_R1_001_000000000", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_L001_R2_001_000000000", full.names = TRUE))
+
+# remove any incorrect samples
+fnFs <- fnFs[!grepl("Bean",fnFs)]
+fnFs <- fnFs[!grepl("banana",fnFs)]
+fnFs <- fnFs[!grepl("BIOMIC",fnFs)]
+fnFs <- fnFs[!grepl("BKU",fnFs)]
+fnFs <- fnFs[!grepl("NC_",fnFs)]
+
+fnRs <- fnRs[!grepl("Bean",fnRs)]
+fnRs <- fnRs[!grepl("banana",fnRs)]
+fnRs <- fnRs[!grepl("BIOMIC",fnRs)]
+fnRs <- fnRs[!grepl("BKU",fnRs)]
+fnRs <- fnRs[!grepl("NC_",fnRs)]
+
+
+#extract sample names
+#sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+sample.names <- word(basename(fnFs), 1, sep = ".fastq")
+sample.names <- gsub("R1_","",as.character(sample.names))
+sample.names <- gsub("_","-",as.character(sample.names))
+```
+
+
+## plot quality
+In gray-scale is a heat map of the frequency of each quality score at each base position. The mean quality score at each position is shown by the green line, and the quartiles of the quality score distribution by the orange lines. The red line shows the scaled proportion of reads that extend to at least that position (this is more useful for other sequencing technologies, as Illumina reads are typically all the same length, hence the flat red line).
+```{r}
+FQ <- plotQualityProfile(fnFs[1:2]) #quality profile forward reads
+RQ <- plotQualityProfile(fnRs[1:2]) #quality profile backward reads
+x11()
+plot(FQ)
+plot(RQ)
+```
+
+## save as basepoint workspace
+```{r}
+save.image("workspaces/base.RData")
+
+```
+
+```{r}
+derep <- derepFastq(fnFs)
+getSequences(derep)
+table(nchar(getSequences(derep)))
+
+``` 
+
+
+# pipeline
+## set trimming size
+based on the quality plots, determine the read size that you wish to keep. Using vline and hline, visualize the cut-off values. 
+```{r}
+#trim sizes
+FR <- 275
+RR <- 210
+#primer sizes
+FP <- 17
+RP <- 21
+
+FQ + geom_hline(yintercept=30) + geom_vline(xintercept=FR)
+RQ + geom_hline(yintercept=30) + geom_vline(xintercept=RR)
+
+set <-paste0(FR,"-",RR,"final")
+workspace <- paste0("workspaces/env",set,".RData")
+```
+
+## filter and trim 
+Filter and trim based on the above values. We’ll use standard filtering parameters: maxN=0 (DADA2 requires no Ns), truncQ=2, rm.phix=TRUE and maxEE=2. The standard filtering parameters are starting points, not set in stone. If you want to speed up downstream computation, consider tightening maxEE. If too few reads are passing the filter, consider relaxing maxEE, perhaps especially on the reverse reads (eg. maxEE=c(2,5)), and reducing the truncLen to remove low quality tails. Remember though, when choosing truncLen for paired-end reads you must maintain overlap after truncation in order to merge them later.
+```{r}
+###   Place filtered files in filtered/ subdirectory 
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(FR,RR), trimLeft = c(FP,RP), 
+                     maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+                     compress=TRUE, multithread=FALSE) # On Windows set multithread=FALSE
+save.image(workspace)
+head(out)
+
+dir.create( paste0("results/",set))
+file = paste0("results/",set,"/",set,".csv")
+write.csv(out, file)
+```
+
+## determine error rates
+The error rates for each possible transition (A→C, A→G, …) are shown. Points are the observed error rates for each consensus quality score. The black line shows the estimated error rates after convergence of the machine-learning algorithm. The red line shows the error rates expected under the nominal definition of the Q-score. Here the estimated error rates (black line) are a good fit to the observed rates (points), and the error rates drop with increased quality as expected. Everything looks reasonable and we proceed with confidence.
+```{r}
+errF <- learnErrors(filtFs, multithread=TRUE)
+save.image(workspace)
+errR <- learnErrors(filtRs, multithread=TRUE)
+save.image(workspace)
+plotErrors(errF, nominalQ=TRUE)
+plotErrors(errR, nominalQ=TRUE)
+```
+
+## determine sample inference
+```{r}
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+save.image(workspace)
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+save.image(workspace)
+dadaFs[[1]]
+```
+
+## merge reads
+```{r}
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+save.image(workspace)
+#Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+```
+
+## construct sequence table
+```{r}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+```
+
+## remove chimeras
+```{r}
+###   Remove chimeras
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+```
+
+## read conservation
+See how many of the reads in the raw data made it through each step of the pipeline. 
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+save.image(workspace)
+head(track)
+
+file = paste0("results/",set,"/track",set,".csv")
+write.csv(track, file)
+```
+
+
+## taxonimic assignment
+make sure the working directory includes a folder tax in which the desired database file is located.
+```{r}
+Silva <- "tax/silva_nr99_v138.1_Species_train_set.fa.gz"
+taxa <- assignTaxonomy(seqtab.nochim, Silva, multithread=TRUE)
+save.image(workspace)
+write.csv(taxa,paste0("results/",set,"/taxa",set,".csv"))
+write.csv(t(seqtab.nochim), paste0("results/",set,"/counts",set,".csv"))
+write.csv(cbind(t(seqtab.nochim),taxa), paste0("results/",set,"/seqtab",set,".csv"), quote=FALSE)
+```
+

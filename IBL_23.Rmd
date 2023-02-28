@@ -1,0 +1,1489 @@
+---
+title: "Simone"
+output: html_document
+date: "2022-10-11"
+editor_options: 
+chunk_output_type: console
+---
+
+# base setup -------------------------------------------------------------------
+```{r, setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+load libraries
+```{r}
+library(VennDiagram)
+library(multcompView)
+library(AICcmodavg)
+library(metagenomeSeq)
+library(dplyr)
+library(tidyr)
+library(phyloseq); packageVersion("phyloseq")
+library(Biostrings); packageVersion("Biostrings")
+library(ggplot2); packageVersion("ggplot2")
+library( gtools) 
+library(ggpubr)
+require(gridExtra)
+library(superheat)
+library(vegan)
+library(microViz)
+library(openxlsx)
+library(colourvalues)
+library(randomcoloR)
+
+```
+
+get functions
+```{r}
+source("~/stage/scripts/functions_micobialanalysis.R")
+
+```
+
+#
+# preprocessing ----------------------------------------------------------------
+
+##load data
+```{r}
+setwd("~/stage/results/275-210")
+theme_set(theme_bw())
+raw.data <- list()
+variables <- list()
+
+## load dada2 data
+raw.data$counts <- as.data.frame(read.csv("counts275-210.csv",header=TRUE,row.names=1,sep = ","))
+colnames(raw.data$counts) <- gsub("X","",as.character(colnames(raw.data$counts)))
+raw.data$taxa <- read.csv("taxa275-210.csv",sep=",",row.names=1)
+
+
+## read metadata
+raw.data$meta <- as.data.frame(read.table("~/stage/data/metadata.txt",row.names = 1))
+rownames(raw.data$meta) <- gsub("-","\\.",as.character(rownames(raw.data$meta)))
+colnames(raw.data$meta) <- c("source","stage","status")
+raw.data$meta <- raw.data$meta[rownames(raw.data$meta) %in% colnames(raw.data$counts), ]
+raw.data$meta$condition <- paste0(raw.data$meta$status,"_",raw.data$meta$stage)
+
+## remove mitochondria and chloroplasts
+variables$remove <- which(raw.data$taxa$Family=="Mitochondria" | raw.data$taxa$Order=="Chloroplast")
+raw.data$counts <- raw.data$counts[-variables$remove,]
+raw.data$taxa <- raw.data$taxa[-variables$remove,]
+
+## remove samples with missing metadata
+variables$missing <- setdiff(colnames(raw.data$counts),rownames(raw.data$meta))
+raw.data$counts <- raw.data$counts[,!(colnames(raw.data$counts) %in% variables$missing)]
+raw.data$meta <- raw.data$meta[!(row.names(raw.data$meta) %in% variables$missing),]
+
+## change nomenclature and sort
+raw.data$counts <- raw.data$counts[,order(colnames(raw.data$counts))]
+raw.data$meta <- raw.data$meta[order(rownames(raw.data$meta)),]
+raw.data$counts.seq <- raw.data$counts
+raw.data$taxa.seq <- raw.data$taxa
+rownames(raw.data$counts) <- paste("ASV",1:nrow(raw.data$taxa),sep="")
+rownames(raw.data$taxa) <- paste("ASV",1:nrow(raw.data$taxa),sep="")
+
+## remove RIL line
+x <- rownames(raw.data$meta[raw.data$meta$status=="RIL",])
+raw.data$counts <- raw.data$counts[,! colnames(raw.data$counts) %in% x]
+raw.data$counts.seq <- raw.data$counts.seq[,! colnames(raw.data$counts.seq) %in% x]
+raw.data$meta <- raw.data$meta[!rownames(raw.data$meta) %in% x,]
+
+## remove samples with <2 features
+variables$nrfeatures <- colSums(raw.data$counts!=0)
+variables$drop <- which(variables$nrfeatures<=1)
+if (length(variables$drop) > 0L){
+raw.data$counts <- raw.data$counts[,-variables$drop]
+raw.data$counts.seq <- raw.data$counts.seq[,-variables$drop]
+raw.data$meta <- raw.data$meta[-variables$drop,]
+}
+
+```
+
+## create frequency plot of count data
+```{r}
+## create frequency plot
+dir.create("data_inspection")
+frequency <- list()
+variables$orders <- c("bulkR","bulkS","seed","spermosphere","rhizosphere")
+
+frequency$table <- data.frame(id=1:nrow(raw.data$meta), 
+                              source=raw.data$meta$source,
+                              status=raw.data$meta$status,
+                              stage= factor(raw.data$meta$stage,levels=variables$orders),
+                              count=rowSums(t(raw.data$counts)))
+
+frequency$plot <- ggplot(arrange(frequency$table,desc(count)), aes(x=status,y=count,fill=stage)) + 
+  geom_col(position = position_dodge2(width = 0.5, preserve = "single")) +
+  scale_fill_brewer(palette="BuPu") + xlab("subject") + ylab("counts") + 
+  facet_wrap(~source) +
+  labs(fill="root compartment")
+
+x11()
+frequency$plot
+ggsave("data_inspection/asv_counts.png", width = 10, height = 4, dpi = 150, units = "in")
+
+```
+
+## remove unsufficient data and split DNA/RNA
+```{r}
+## removal of seed samples
+variables$seed.samples <- rownames(raw.data$meta[which(raw.data$meta$stage=="seed"),])
+raw.data$counts.seed <- raw.data$counts[,(colnames(raw.data$counts) %in% variables$seed.samples)]
+raw.data$counts <- raw.data$counts[,!(colnames(raw.data$counts) %in% variables$seed.samples)]
+raw.data$counts.seq <- raw.data$counts.seq[,!(colnames(raw.data$counts.seq) %in% variables$seed.samples)]
+raw.data$meta.seed <- raw.data$meta[(rownames(raw.data$meta) %in% variables$seed.samples),]
+raw.data$meta <- raw.data$meta[!(rownames(raw.data$meta) %in% variables$seed.samples),]
+
+## change stage of bulk
+raw.data$meta[raw.data$meta$stage=="bulkR",]$stage <- "rhizosphere"
+raw.data$meta[raw.data$meta$stage=="bulkS",]$stage <- "spermosphere"
+write.table(raw.data$meta,"mapping1.txt",sep = "\t")
+
+## split RNA and DNA
+DNA <- list()
+RNA <- list()
+variables$RNA.samples <- rownames(raw.data$meta[which(raw.data$meta["source"]=="RNA"),])
+DNA$counts <- raw.data$counts[,!(colnames(raw.data$counts) %in% variables$RNA.samples)]
+DNA$meta <- raw.data$meta[!(rownames(raw.data$meta) %in% variables$RNA.samples),]
+RNA$counts <- raw.data$counts[,colnames(raw.data$counts) %in% variables$RNA.samples]
+RNA$meta <- raw.data$meta[rownames(raw.data$meta) %in% variables$RNA.samples,]
+
+## remove weird rhizosphere wild sample from DNA
+variables$DNA.wild.rhizo <- rownames(DNA$meta[DNA$meta$stage=="rhizosphere" & DNA$meta$status=="wild",])
+variables$counts.wild.rhizo <- DNA$counts[,variables$DNA.wild.rhizo]
+variables$remove <- colnames(variables$counts.wild.rhizo[,names(sort(colSums(variables$counts.wild.rhizo),decreasing = F))])[1]
+DNA$counts <- DNA$counts[,(colnames(DNA$counts) != variables$remove)]
+DNA$meta <- DNA$meta[(rownames(DNA$meta) != variables$remove),]
+
+## removal of ASVs with zero counts
+variables$zero.DNA <- which(rowSums(DNA$counts)==0)
+variables$zero.RNA <- which(rowSums(RNA$counts)==0)
+DNA$counts <- DNA$counts[-variables$zero.DNA,]
+DNA$taxa <- raw.data$taxa[-variables$zero.DNA,]
+RNA$taxa <- raw.data$taxa[-variables$zero.RNA,]
+RNA$counts <- RNA$counts[-variables$zero.RNA,]
+
+```
+
+#
+# normalisation ----------------------------------------------------------------
+
+## CSS
+css normalise data
+```{r}
+## remove ineffective samples and normalize
+DNA.EF <- do.CSS(DNA,"DNA")
+RNA.EF <- do.CSS(RNA,"RNA")
+
+## change ASV to sequence for phyloseq object creation
+variables$linesDNA <- as.numeric(gsub("ASV","",as.character(rownames(DNA.EF$mat))))
+rownames(DNA.EF$mat) <- rownames(raw.data$counts.seq[variables$linesDNA,])
+rownames(DNA.EF$taxa) <- rownames(raw.data$counts.seq[variables$linesDNA,])
+DNA.CSS <- make.phylo(DNA,DNA.EF)
+
+variables$linesRNA <- as.numeric(gsub("ASV","",as.character(rownames(RNA.EF$mat))))
+rownames(RNA.EF$mat) <- rownames(raw.data$counts.seq[variables$linesRNA,])
+rownames(RNA.EF$taxa) <- rownames(raw.data$counts.seq[variables$linesRNA,])
+RNA.CSS <- make.phylo(RNA,RNA.EF)
+
+```
+
+TREE -- export fasta of effective DNA sequences for tree formation
+```{r}
+dir.create("tree")
+fasta <- list()
+fasta$asv_DNA <- rownames(as.data.frame(DNA.CSS@otu_table))
+fasta$seq <- raw.data$counts.seq[match(asv,rownames(raw.data$counts)),]
+fasta$seq <- rownames(seq)
+fasta$seq <- as.list(seq)
+write.fasta(fasta$seq,fasta$asv,"tree/DNA_CSS.fasta")
+
+```
+
+
+
+## rarefaction
+rarefy data
+```{r}
+set.seed(42)
+variables$alpha <- c("Observed","Chao1","Shannon")
+
+##################################### DNA #####################################
+
+DNA.rare <- list()
+DNA.rare$ps <-  phyloseq(otu_table(as.matrix(DNA$counts), taxa_are_rows=T), sample_data(DNA$meta), tax_table(as.matrix(DNA$taxa)))
+DNA.rare$ps.rare <- rarefy_even_depth(DNA.rare$ps, sample.size = min(sample_sums(DNA.rare$ps)), verbose = F)
+
+##################################### RNA #####################################
+
+RNA.rare <- list()
+RNA.rare$ps <- phyloseq(otu_table(as.matrix(RNA$counts), taxa_are_rows=T), sample_data(RNA$meta), tax_table(as.matrix(RNA$taxa)))
+RNA.rare$ps.rare <- rarefy_even_depth(RNA.rare$ps, sample.size = min(sample_sums(RNA.rare$ps)), verbose = F)
+
+```
+
+rarefaction curves
+```{r}
+
+## DNA
+DNA.rare$rarefaction_curve_data <- calculate_rarefaction_curves(DNA.rare$ps, variables$alpha, rep(c(1, 10, 100, 1000, 1:100 * 10000), each = 10))
+
+DNA.rare$rarefaction_curve_data_summary <- ddply(DNA.rare$rarefaction_curve_data, c('Depth', 'Sample', 'Measure'), summarise, Alpha_diversity_mean = mean(Alpha_diversity), Alpha_diversity_sd = sd(Alpha_diversity))
+
+DNA.rare$plot <- plot.rarefaction(merge(DNA.rare$rarefaction_curve_data_summary, data.frame(sample_data(DNA.rare$ps)), by.x = 'Sample', by.y = 'row.names'))
+
+x11()
+plot(DNA.rare$plot) + ggtitle("Rarefaction curves for DNA samples")
+
+
+##RNA
+RNA.rare$rarefaction_curve_data <- calculate_rarefaction_curves(RNA.rare$ps, variables$alpha, rep(c(1, 10, 100, 1000, 1:100 * 10000), each = 10))
+
+RNA.rare$rarefaction_curve_data_summary <- ddply(RNA.rare$rarefaction_curve_data, c('Depth', 'Sample', 'Measure'), summarise, Alpha_diversity_mean = mean(Alpha_diversity), Alpha_diversity_sd = sd(Alpha_diversity))
+
+RNA.rare$plot <- plot.rarefaction(merge(RNA.rare$rarefaction_curve_data_summary, data.frame(sample_data(RNA.rare$ps)), by.x = 'Sample', by.y = 'row.names'))
+
+
+x11()
+plot(RNA.rare$plot) + ggtitle("Rarefaction curves for RNA samples")
+
+```
+
+
+#
+# beta diversity ---------------------------------------------------------------
+
+```{r}
+dir.create("beta_div")
+
+```
+
+## for DNA 
+
+get DNA statistics for bray distances
+```{r}
+DNA.beta <- list()
+DNA.beta$complete <- get.beta(DNA.CSS)
+DNA.beta$spermosphere <- get.beta(ps_filter(DNA.CSS,stage=="spermosphere"))
+DNA.beta$rhizosphere <- get.beta(ps_filter(DNA.CSS,stage=="rhizosphere"))
+
+DNA.beta$complete$adonis_stage
+DNA.beta$complete$adonis_stat
+DNA.beta$complete$adonis_two
+DNA.beta$complete$adonis_int
+
+DNA.beta$spermosphere$adonis_stat
+DNA.beta$rhizosphere$adonis_stat
+```
+
+plot CAP DNA
+```{r}
+x11()
+DNA.beta$complete$cap 
+  ggtitle("CAP DNA samples") + 
+  scale_shape_manual(values=c(3, 15, 17)) + 
+  labs(color='soil compartment',shape="genotype")
+ggsave("beta_div/DNA_CAP_full.png", width = 4, height = 3, dpi = 150, units = "in")  
+
+x11()
+DNA.beta$spermosphere$cap + 
+  ggtitle("CAP DNA samples - spermosphere") + 
+  scale_shape_manual(values=c(3, 15, 17)) + 
+  scale_color_manual(values = "#00bfc4") +
+  labs(color='soil compartment',shape="genotype")
+ggsave("beta_div/DNA_CAP_spermosphere.png", width = 4, height = 3, dpi = 150, units = "in")
+
+x11()
+DNA.beta$rhizosphere$cap + 
+  ggtitle("CAP DNA samples - rhizosphere") + 
+  scale_shape_manual(values=c(3, 15, 17)) +
+  labs(color='soil compartment',shape="genotype")
+ggsave("beta_div/DNA_CAP_rhizosphere.png", width = 4, height = 3, dpi = 150, units = "in")
+
+```
+
+## for RNA
+
+get RNA statistics for bray distances
+```{r}
+##################################### RNA #####################################
+RNA.beta <- list()
+RNA.beta$complete <- get.beta(RNA.CSS)
+RNA.beta$spermosphere <- get.beta(ps_filter(RNA.CSS,stage=="spermosphere"))
+RNA.beta$rhizosphere <- get.beta(ps_filter(RNA.CSS,stage=="rhizosphere"))
+
+RNA.beta$complete$adonis_stage
+RNA.beta$complete$adonis_two
+RNA.beta$complete$adonis_int
+
+RNA.beta$spermosphere$adonis_stat
+RNA.beta$rhizosphere$adonis_stat
+
+```
+
+plot CAP RNA
+```{r}
+x11()
+RNA.beta$complete$cap + 
+  ggtitle("CAP RNA samples") + 
+  scale_shape_manual(values=c(3, 15, 17)) + 
+  labs(color='root compartment',shape="genotype")
+ggsave("beta_div/RNA_CAP_full.png", width = 4, height = 3, dpi = 150, units = "in")  
+
+x11()
+RNA.beta$spermosphere$cap + 
+  ggtitle("CAP RNA samples - spermosphere") + 
+  scale_shape_manual(values=c(3, 15, 17)) + 
+  scale_color_manual(values = "#00bfc4") +
+  labs(color='root compartment',shape="genotype")
+ggsave("beta_div/RNA_CAP_spermosphere.png", width = 4, height = 3, dpi = 150, units = "in")
+
+x11()
+RNA.beta$rhizosphere$cap + 
+  ggtitle("CAP RNA samples - rhizosphere") + 
+  scale_shape_manual(values=c(3, 15, 17)) +
+  labs(color='root compartment',shape="genotype")
+ggsave("beta_div/RNA_CAP_rhizosphere.png", width = 4, height = 3, dpi = 150, units = "in")
+
+
+```
+
+
+
+#
+# relative abundance  ----------------------------------------------------------
+
+calculate relative abundances
+```{r}
+#calcualte and export for heatmap creation in iTOL
+dir.create("rel_abundance")
+abundance <- list()
+abundance$DNA <- export_abundance(DNA,DNA.CSS,"DNA")
+abundance$RNA <- export_abundance(RNA,RNA.CSS,"RNA")
+sig <- list()
+box <- list()
+
+```
+
+relative abundance plots
+```{r}
+#DNA
+X11()
+ggplot(psmelt(DNA.CSS), aes_string(x = "stage", y="Abundance", fill = "Phylum")) + geom_bar(stat = "identity", position = "fill") + theme(axis.text.x = element_text(angle = -90, hjust = 0)) + ggtitle("DNA relative abundance") + facet_wrap(~status) 
+
+
+
+order <- names(sort(taxa_sums(tax_glom(DNA.CSS,rank_names(DNA.CSS)[2])), decreasing=TRUE))
+n <- length(DNA$taxa[order,"Phylum"])
+palette <- distinctColorPalette(n)
+df <- psmelt(DNA.CSS)
+df$Phylum <- factor(df$Phylum, levels =DNA$taxa[order,"Phylum"] )
+
+X11()
+ggplot(df, aes_string(x = "stage", y="Abundance", fill = "Phylum")) + geom_bar(stat = "identity", position = "fill") + theme(axis.text.x = element_text(angle = -90, hjust = 0)) + ggtitle("DNA relative abundance") + facet_wrap(~status,ncol=1)+  scale_fill_manual(values=palette) + coord_flip() 
+
+
+
+
+
+#RNA
+X11()
+ggplot(psmelt(RNA.CSS), aes_string(x = "stage", y="Abundance", fill = "Phylum")) + geom_bar(stat = "identity", position = "fill") + theme(axis.text.x = element_text(angle = -90, hjust = 0)) + ggtitle("RNA relative abundance") + facet_wrap(~status)
+
+#combined
+order <- names(sort(taxa_sums(tax_glom(DNA.CSS,rank_names(DNA.CSS)[2])), decreasing=TRUE))
+n <- length(DNA$taxa[order,"Phylum"])
+palette <- distinctColorPalette(n)
+df <- psmelt(merge_phyloseq(DNA.CSS,RNA.CSS))
+df$Phylum <- factor(df$Phylum, levels =DNA$taxa[order,"Phylum"] )
+
+palette <- distinctColorPalette(n)
+X11()
+ggplot(df, aes_string(x = "stage", y="Abundance", fill = "Phylum")) + geom_bar(stat = "identity", position = "fill") + theme(axis.text.x = element_text(angle = -90, hjust = 0)) + ggtitle("Relative abundance") + facet_wrap(~ source + status, ncol=6) + 
+    scale_fill_manual(values=palette)
+ggsave("rel_abundance/rel_abundances.png", width = 4, height = 3, dpi = 150, units = "in") 
+
+
+
+
+
+
+```
+
+## DNA
+t-test on relative abundance DNA
+```{r}
+sig <- list()
+
+cond <- list()
+cond$m_r <- rownames(DNA$meta[DNA$meta$condition== "modern_rhizosphere",])
+cond$w_r <- c(rownames(DNA$meta[DNA$meta$condition== "wild_rhizosphere",]),"missing")
+cond$m_s <- rownames(DNA$meta[DNA$meta$condition== "modern_spermosphere",])
+cond$w_s <- rownames(DNA$meta[DNA$meta$condition== "wild_spermosphere",])
+
+```
+
+construct long table at phylum level
+```{r}
+table <- abundance$DNA$Phylum
+table$phylum <- rownames(table)
+sig$DNA <- get.tstat(table,DNA$meta,"phylum",0.05)
+
+df <- abundance$DNA$Phylum
+df <- df[,colnames(df) %in% c(cond$m_r,cond$w_r,cond$m_s,cond$w_s)]
+df$missing <- NA
+df$phylum <- rownames(df)
+
+box$stage <- reshape(df, direction='long',
+        varying=c(c(rbind(cond$m_r,cond$w_r)),c(rbind(cond$m_s,cond$w_s))),
+        timevar='stage',
+        times=c(rep("rhizosphere",4), rep("spermosphere",4)),
+        v.names=c('modern', 'wild'),
+        idvar='asv')
+
+box$geno <- reshape(df, direction='long',
+        varying=c(c(rbind(cond$m_r,cond$m_s)),c(rbind(cond$w_r,cond$w_s))),
+        timevar='genotype',
+        times=c(rep("modern",4), rep("wild",4)),
+        v.names=c('rhizosphere', 'spermosphere'),
+        idvar='asv')
+```
+
+make boxplots
+```{r}
+
+## box lots of significantly differnet relative abundances of families between spermosphere and rhizosphere
+x11()
+ggplot(subset(box$stage, phylum %in% names(sig$DNA$modern)), aes(x=stage,y=modern,fill=phylum)) + 
+  geom_boxplot() + 
+  facet_wrap(~phylum, scales = "free_y",nrow = 1) + 
+  geom_jitter(size=1,aes(col=phylum)) +geom_point(alpha = 0.01) +  
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  ylab("% relative abudance") 
+
+
+x11()
+ggplot(subset(box$stage, phylum %in% names(sig$DNA$wild)), aes(x=stage,y=wild,fill=phylum)) + 
+  geom_boxplot() + 
+  facet_wrap(~phylum, scales = "free_y",nrow = 1) + 
+  geom_jitter(size=1,aes(col=phylum)) +geom_point(alpha = 0.01) +  
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  ylab("% relative abudance") 
+
+
+## combined boxlots
+df <- subset(box$stage, phylum %in% names(sig$DNA$modern))[,colnames(box$stage)!="wild"] %>% 
+  rename("modern" = "value") %>% 
+  mutate(genotype = "modern")
+
+df <- rbind(df,subset(box$stage, phylum %in% names(sig$DNA$wild))[,colnames(box$stage)!="modern"] %>% 
+              rename("wild"="value") %>% 
+              mutate(genotype = "wild"))
+
+x11()
+ggplot(df, aes(x=stage,y=value,fill=phylum)) + 
+  geom_boxplot() + 
+  facet_wrap(genotype~phylum,scales = "free_y",nrow = 2,labeller=function(df) {list(as.character(df[,1]))}) +
+  geom_jitter(size=1,aes(col=phylum)) + 
+  geom_point(alpha = 0.01) +  
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  ylab("% relative abudance")
+
+
+## genotype
+df <- subset(box$geno, phylum %in% names(sig$DNA$rhiz))[,colnames(box$geno)!="spermosphere"] %>% rename("rhizosphere"="value")%>% mutate(stage = "rhizosphere")
+df <- rbind(df,subset(box$geno, phylum %in% names(sig$DNA$sperm))[,colnames(box$geno)!="rhizosphere"] %>% rename("spermosphere"="value")%>% mutate(stage = "spermosphere"))
+
+x11()
+ggplot(df, aes(x=genotype,y=value,fill=phylum)) + 
+  geom_boxplot() + 
+  facet_wrap(~phylum+stage,scales = "free_y",nrow = 1,labeller=function(df) {list(as.character(df[,2]))}) + 
+  geom_jitter(size=1,aes(col=phylum)) + 
+  geom_point(alpha = 0.01) +  
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  ylab("% relative abudance")
+
+
+```
+
+
+REMOVE
+```{r}
+
+x11()
+ggplot(subset(box$stage, phylum == "Proteobacteria"), aes(x=stage,y=modern)) + 
+  geom_boxplot(fill="#EBB639") + 
+  geom_jitter(size=1) + geom_point(colour = "#000000",alpha = 0.01) +  
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  ylab("% relative abudance") 
+
+x11()
+ggplot(subset(box$stage, phylum == "Proteobacteria"), aes(x=stage,y=wild)) + 
+  geom_boxplot(fill="#EBB639") + 
+  geom_jitter(size=1) + geom_point(colour = "#000000",alpha = 0.01) +  
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  ylab("% relative abudance") 
+
+
+x11()
+ggplot(subset(box$stage, phylum == "Verrucomicrobiota"), aes(x=stage,y=modern)) + 
+  geom_boxplot(fill="#ADE9D4") + 
+  geom_jitter(size=1) + geom_point(colour = "#000000",alpha = 0.01) +  
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  ylab("% relative abudance") 
+
+
+x11()
+ggplot(subset(box$stage, phylum == "Verrucomicrobiota"), aes(x=stage,y=wild)) + 
+  geom_boxplot(fill="#ADE9D4") + 
+  geom_jitter(size=1) + geom_point(colour = "#000000",alpha = 0.01) +  
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  ylab("% relative abudance") 
+
+
+x11()
+ggplot(subset(box$stage, phylum == "Actinobacteriota"), aes(x=stage,y=modern)) + 
+  geom_boxplot(fill="#E486B6") + 
+  geom_jitter(size=1) + geom_point(colour = "#000000",alpha = 0.01) +  
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  ylab("% relative abudance") 
+
+
+x11()
+ggplot(subset(box$stage, phylum == "Actinobacteriota"), aes(x=stage,y=wild)) + 
+  geom_boxplot(fill="#E486B6") + 
+  geom_jitter(size=1) + geom_point(colour = "#000000",alpha = 0.01) +  
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  ylab("% relative abudance") 
+
+
+x11()
+ggplot(subset(box$stage, phylum == "Chloroflexi"), aes(x=stage,y=modern)) + 
+  geom_boxplot(fill="#CC6CDE") + 
+  geom_jitter(size=1) + geom_point(colour = "#000000",alpha = 0.01) +  
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  ylab("% relative abudance") 
+
+
+x11()
+ggplot(subset(box$stage, phylum == "Chloroflexi"), aes(x=stage,y=wild)) + 
+  geom_boxplot(fill="#CC6CDE") + 
+  geom_jitter(size=1) + geom_point(colour = "#000000",alpha = 0.01) +  
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  ylab("% relative abudance") 
+
+
+
+```
+
+
+## RNA
+
+ t-test on relative abundance RNA
+```{r}
+cond <- list()
+cond$m_r <- rownames(RNA$meta[RNA$meta$condition== "modern_rhizosphere",])
+cond$w_r <- rownames(RNA$meta[RNA$meta$condition== "wild_rhizosphere",])
+cond$m_s <- rownames(RNA$meta[RNA$meta$condition== "modern_spermosphere",])
+cond$w_s <- rownames(RNA$meta[RNA$meta$condition== "wild_spermosphere",])
+
+```
+
+contsruct long table at phylum level
+```{r}
+table <- abundance$RNA$Phylum
+table$phylum <- rownames(table)
+sig$RNA <- get.tstat(table,RNA$meta,"phylum",0.05)
+
+df <- abundance$RNA$Phylum
+df <- df[,colnames(df) %in% c(cond$m_r,cond$w_r,cond$m_s,cond$w_s)]
+df$missing <- NA
+df$phylum <- rownames(df)
+
+box$stage <- reshape(df, direction='long',
+        varying=c(c(rbind(cond$m_r,cond$w_r)),c(rbind(cond$m_s,cond$w_s))),
+        timevar='stage',
+        times=c(rep("rhizosphere",4), rep("spermosphere",4)),
+        v.names=c('modern', 'wild'),
+        idvar='asv')
+
+box$geno <- reshape(df, direction='long',
+        varying=c(c(rbind(cond$m_r,cond$m_s)),c(rbind(cond$w_r,cond$w_s))),
+        timevar='genotype',
+        times=c(rep("modern",4), rep("wild",4)),
+        v.names=c('rhizosphere', 'spermosphere'),
+        idvar='asv')
+
+```
+
+make boxplots
+```{r}
+## box lots of significantly differnet relative abundances of families between spermosphere and rhizosphere
+x11()
+ggplot(subset(box$stage, phylum %in% names(sig$RNA$modern)), aes(x=stage,y=modern,fill=phylum)) + 
+  geom_boxplot() + 
+  facet_wrap(~phylum, scales = "free_y",nrow = 1) + 
+  geom_jitter(size=1,aes(col=phylum)) +geom_point(alpha = 0.01) +  
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  ylab("% relative abudance") 
+
+x11()
+ggplot(subset(box$stage, phylum %in% names(sig$RNA$wild)), aes(x=stage,y=wild,fill=phylum)) + 
+  geom_boxplot() + 
+  facet_wrap(~phylum, scales = "free_y",nrow = 1) + 
+  geom_jitter(size=1,aes(col=phylum)) +geom_point(alpha = 0.01) +  
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  ylab("% relative abudance") 
+
+
+## combined boxlots
+df <- subset(box$stage, phylum %in% names(sig$RNA$modern))[,colnames(box$stage)!="wild"] %>% 
+  rename("modern" = "value") %>% 
+  mutate(genotype = "modern")
+
+df <- rbind(df,subset(box$stage, phylum %in% names(sig$RNA$wild))[,colnames(box$stage)!="modern"] %>% 
+              rename("wild"="value") %>% 
+              mutate(genotype = "wild"))
+
+x11()
+ggplot(df, aes(x=stage,y=value,fill=phylum)) + 
+  geom_boxplot() + 
+  facet_wrap(genotype~phylum,scales = "free_y",nrow = 2,labeller=function(df) {list(as.character(df[,1]))}) +
+  geom_jitter(size=1,aes(col=phylum)) + 
+  geom_point(alpha = 0.01) +  
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  ylab("% relative abudance")
+
+
+## genotype
+df <- subset(box$geno, phylum %in% names(sig$RNA$rhiz))[,colnames(box$geno)!="spermosphere"] %>% rename("rhizosphere"="value")%>% mutate(stage = "rhizosphere")
+df <- rbind(df,subset(box$geno, phylum %in% names(sig$RNA$sperm))[,colnames(box$geno)!="rhizosphere"] %>% rename("spermosphere"="value")%>% mutate(stage = "spermosphere"))
+
+x11()
+ggplot(df, aes(x=genotype,y=value,fill=phylum)) + 
+  geom_boxplot() + 
+  facet_wrap(~phylum+stage,scales = "free_y",nrow = 1,labeller=function(df) {list(as.character(df[,2]))}) + 
+  geom_jitter(size=1,aes(col=phylum)) + 
+  geom_point(alpha = 0.01) +  
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  ylab("% relative abudance")
+
+
+```
+
+
+
+#
+# alpha diversity --------------------------------------------------------------
+
+obtain alpha diversity metrics
+```{r}
+dir.create("alpha_div")
+
+variables$rhizo <- "#f8766d"
+variables$spermo <- "#00bfc4"
+```
+
+for DNA
+```{r}
+##################################### DNA #####################################
+DNA.alpha <- list()
+DNA.alpha$complete <- get.alpha(DNA.rare$ps.rare,variables$alpha,"complet_DNAe",F)
+DNA.alpha$spermo <- get.alpha(ps_filter(DNA.rare$ps.rare, stage=="spermosphere"),variables$alpha,"spermo_DNA",F)
+DNA.alpha$rhizo <- get.alpha(ps_filter(DNA.rare$ps.rare, stage=="rhizosphere"),variables$alpha,"rhizo_DNA",F)
+
+
+x11()
+plot_richness(DNA.rare$ps.rare, x="status", measures=variables$alpha, color = "stage") + geom_boxplot(alpha=0.5,position = "identity")+ labs(color = "soil compartment") + xlab("genotype")
+ggsave("alpha_div/DNA_full.png", width = 4.5, height = 4, dpi = 150, units = "in")
+
+x11()
+plot_richness(ps_filter(DNA.rare$ps.rare, stage =="spermosphere"), x="status", measures=variables$alpha, color = "stage") + geom_boxplot(alpha=0.5,position = "identity") + scale_y_continuous(expand = c(0.25,0)) + ggtitle("DNA") + scale_color_manual(values = variables$spermo)
+
+x11()
+plot_richness(ps_filter(DNA.rare$ps.rare, stage =="rhizosphere"), x="status", measures=variables$alpha, color = "stage") + geom_boxplot(alpha=0.5,position = "identity") + scale_y_continuous(expand = c(0.25,0)) + ggtitle("DNA") + scale_color_manual(values = variables$rhizo)
+```
+
+for RNA
+```{r}
+##################################### RNA #####################################
+RNA.alpha <- list()
+RNA.alpha$condition <- get.alpha(RNA.rare$ps.rare,variables$alpha,"complete_RNA", F)
+RNA.alpha$spermo <- get.alpha(ps_filter(RNA.rare$ps.rare, stage=="spermosphere"),variables$alpha,"spermo_RNA", F)
+RNA.alpha$rhizo <- get.alpha(ps_filter(RNA.rare$ps.rare, stage=="rhizosphere"),variables$alpha,"rhizo_RNA",F)
+
+x11()
+plot_richness(RNA.rare$ps.rare, x="status", measures=variables$alpha, color = "stage") + 
+  geom_boxplot(alpha=0.5,position = "identity")  + 
+  labs(color='soil compartment',shape="genotype") + xlab("genotype")
+ggsave("alpha_div/RNA_full.png", width = 5, height = 4, dpi = 150, units = "in")
+
+x11()
+plot_richness(ps_filter(RNA.rare$ps.rare, stage =="spermosphere"), x="status", measures=variables$alpha, color = "stage") + geom_boxplot(alpha=0.5,position = "identity") + scale_y_continuous(expand = c(0.25,0)) + ggtitle("RNA") + scale_color_manual(values = variables$spermo)
+
+x11()
+plot_richness(ps_filter(RNA.rare$ps.rare, stage =="rhizosphere"), x="status", measures=variables$alpha, color = "stage") + geom_boxplot(alpha=0.5,position = "identity") + scale_y_continuous(expand = c(0.25,0)) + ggtitle("RNA") + scale_color_manual(values = variables$rhizo)
+
+
+```
+
+#
+# unique ASVs ------------------------------------------------------------------
+
+## DNA
+investigate unique effective ASVs in each stage and status DNA
+
+```{r}
+uniqueASVs.DNA <- list()
+
+# get ASVs found in each condition
+uniqueASVs.DNA$m_s <- rownames(otu_table(ps_filter(DNA.rare$ps.rare,condition=="modern_spermosphere")))
+uniqueASVs.DNA$w_s <- rownames(otu_table(ps_filter(DNA.rare$ps.rare,condition=="wild_spermosphere")))
+uniqueASVs.DNA$b_s <- rownames(otu_table(ps_filter(DNA.rare$ps.rare,condition=="bulk_bulkS")))
+uniqueASVs.DNA$m_r <- rownames(otu_table(ps_filter(DNA.rare$ps.rare,condition=="modern_rhizosphere")))
+uniqueASVs.DNA$w_r <- rownames(otu_table(ps_filter(DNA.rare$ps.rare,condition=="wild_rhizosphere")))
+uniqueASVs.DNA$b_r <- rownames(otu_table(ps_filter(DNA.rare$ps.rare,condition=="bulk_bulkR")))
+
+# filter out ASVs from bulk soil
+uniqueASVs.DNA$m_s_filt <- setdiff(uniqueASVs.DNA$m_s,uniqueASVs.DNA$b_s)
+uniqueASVs.DNA$w_s_filt <- setdiff(uniqueASVs.DNA$w_s,uniqueASVs.DNA$b_s)
+uniqueASVs.DNA$m_r_filt <- setdiff(uniqueASVs.DNA$m_r,uniqueASVs.DNA$b_r)
+uniqueASVs.DNA$w_r_filt <- setdiff(uniqueASVs.DNA$w_r,uniqueASVs.DNA$b_r)
+uniqueASVs.DNA$mod_filt <- setdiff(uniqueASVs.DNA$m_s_filt,uniqueASVs.DNA$w_s)
+uniqueASVs.DNA$wild_filt <- setdiff(uniqueASVs.DNA$w_s_filt,uniqueASVs.DNA$m_s)
+
+## get unique ASVs
+uniqueASVs.DNA$m_s_unique <- setdiff(uniqueASVs.DNA$m_s_filt,uniqueASVs.DNA$w_s)
+uniqueASVs.DNA$w_s_unique <- setdiff(uniqueASVs.DNA$w_s_filt,uniqueASVs.DNA$m_s)
+uniqueASVs.DNA$m_r_unique <- setdiff(uniqueASVs.DNA$m_r_filt,uniqueASVs.DNA$w_r)
+uniqueASVs.DNA$w_r_unique <- setdiff(uniqueASVs.DNA$w_r_filt,uniqueASVs.DNA$m_r)
+
+
+# get families only found in certain statuses
+uniqueASVs.DNA$mod_fam <- unique(as.data.frame(tax_table(ps_filter(DNA.rare$ps.rare,status=="modern")))$Family)
+uniqueASVs.DNA$wild_fam <- unique(as.data.frame(tax_table(ps_filter(DNA.rare$ps.rare,status=="wild")))$Family)
+uniqueASVs.DNA$bulk_fam <- unique(as.data.frame(tax_table(ps_filter(DNA.rare$ps.rare,status=="bulk")))$Family)
+
+
+# get families per condition
+uniqueASVs.DNA$mod_fam_s <- unique(as.data.frame(tax_table(ps_filter(DNA.rare$ps.rare,condition=="modern_spermosphere")))$Family)
+uniqueASVs.DNA$wild_fam_s <- unique(as.data.frame(tax_table(ps_filter(DNA.rare$ps.rare,condition=="wild_spermosphere")))$Family)
+uniqueASVs.DNA$bulk_fam_s <- unique(as.data.frame(tax_table(ps_filter(DNA.rare$ps.rare,condition=="bulk_bulkS")))$Family)
+
+uniqueASVs.DNA$mod_fam_r <- unique(as.data.frame(tax_table(ps_filter(DNA.rare$ps.rare,condition=="modern_rhizosphere")))$Family)
+uniqueASVs.DNA$wild_fam_r <- unique(as.data.frame(tax_table(ps_filter(DNA.rare$ps.rare,condition=="wild_rhizosphere")))$Family)
+uniqueASVs.DNA$bulk_fam_r <- unique(as.data.frame(tax_table(ps_filter(DNA.rare$ps.rare,condition=="bulk_bulkR")))$Family)
+
+
+# get ASVs and families found in seed samples
+uniqueASVs.DNA$mod_seed <- rownames(raw.data$counts.seed[,raw.data$meta.seed$status=="modern"][apply(raw.data$counts.seed[raw.data$meta.seed$status =="wild",],1,function(x) !all(x==0)),])
+uniqueASVs.DNA$wild_seed <- rownames(raw.data$counts.seed[,raw.data$meta.seed$status=="wild"][apply(raw.data$counts.seed[raw.data$meta.seed$status =="modern",],1,function(x) !all(x==0)),])
+uniqueASVs.DNA$mod_seed_fam <- na.omit(DNA$taxa[rownames(DNA$taxa) %in% uniqueASVs.DNA$mod_seed,]$Family)
+uniqueASVs.DNA$wild_seed_fam <- na.omit(DNA$taxa[rownames(DNA$taxa) %in% uniqueASVs.DNA$wild_seed,]$Family)
+
+```
+
+```{r}
+
+# get spermosphere to rhizosphere conservation
+length(intersect(uniqueASVs.DNA$m_s,uniqueASVs.DNA$m_r))/length(unique(c(uniqueASVs.DNA$m_s,uniqueASVs.DNA$m_r))) 
+length(intersect(uniqueASVs.DNA$w_s,uniqueASVs.DNA$w_r))/length(unique(c(uniqueASVs.DNA$w_s,uniqueASVs.DNA$w_r)))
+
+## for unique ASVs
+length(intersect(uniqueASVs.DNA$m_s_filt,uniqueASVs.DNA$m_r_filt))/length(unique(c(uniqueASVs.DNA$m_s_filt,uniqueASVs.DNA$m_r_filt))) 
+length(intersect(uniqueASVs.DNA$w_s_filt,uniqueASVs.DNA$w_r_filt))/length(unique(c(uniqueASVs.DNA$w_s_filt,uniqueASVs.DNA$w_r_filt)))
+
+
+## get family counts of unique asvs per status
+uniqueASVs.DNA$mod_fam_count_s <- as.data.frame(sort(table(DNA$taxa[match(setdiff(uniqueASVs.DNA$m_s_filt, uniqueASVs.DNA$w_s_filt),rownames(DNA$taxa)),"Family"]),decreasing = T))
+uniqueASVs.DNA$wild_fam_count_s <- as.data.frame(sort(table(DNA$taxa[match(setdiff(uniqueASVs.DNA$w_s_filt, uniqueASVs.DNA$m_s_filt),rownames(DNA$taxa)),"Family"]),decreasing = T))
+uniqueASVs.DNA$mod_fam_count_r <- as.data.frame(sort(table(DNA$taxa[match(setdiff(uniqueASVs.DNA$m_r_filt, uniqueASVs.DNA$w_r_filt),rownames(DNA$taxa)),"Family"]),decreasing = T))
+uniqueASVs.DNA$wild_fam_count_r <- as.data.frame(sort(table(DNA$taxa[match(setdiff(uniqueASVs.DNA$w_r_filt, uniqueASVs.DNA$m_r_filt),rownames(DNA$taxa)),"Family"]),decreasing = T))
+
+
+
+# unique families to genotypes in spermosphere compartments
+
+## modern
+uniqueASVs.DNA$mod_fam_filt <- setdiff(setdiff(uniqueASVs.DNA$mod_fam_s,uniqueASVs.DNA$wild_fam_s),uniqueASVs.DNA$bulk_fam_s)
+clipr::write_clip(uniqueASVs.DNA$mod_fam_filt)
+table(DNA$taxa[rownames(DNA$taxa) %in% uniqueASVs.DNA$m_s_unique,"Family"])[uniqueASVs.DNA$mod_fam_filt]
+
+## wild
+uniqueASVs.DNA$wild_fam_filt <-setdiff(setdiff(uniqueASVs.DNA$wild_fam_s,uniqueASVs.DNA$mod_fam_s),uniqueASVs.DNA$bulk_fam_s) 
+clipr::write_clip(uniqueASVs.DNA$wild_fam_filt)
+table(DNA$taxa[rownames(DNA$taxa) %in% uniqueASVs.DNA$w_s_unique,"Family"])[uniqueASVs.DNA$wild_fam_filt]
+
+
+
+# unique families to genotypes in rhizosphere compartments
+x <- table(DNA$taxa[rownames(DNA$taxa) %in% uniqueASVs.DNA$m_r_unique,"Family"])[setdiff(setdiff(uniqueASVs.DNA$mod_fam_r,uniqueASVs.DNA$wild_fam_r),uniqueASVs.DNA$bulk_fam_r)]
+x
+write.table(x,"clipboard", sep="\t")
+
+x <- table(DNA$taxa[rownames(DNA$taxa) %in% uniqueASVs.DNA$w_r_unique,"Family"])[setdiff(setdiff(uniqueASVs.DNA$wild_fam_r,uniqueASVs.DNA$mod_fam_r),uniqueASVs.DNA$bulk_fam_r)]
+x
+write.table(x,"clipboard", sep="\t")
+
+setdiff(setdiff(uniqueASVs.DNA$wild_fam_r,uniqueASVs.DNA$mod_fam_r),uniqueASVs.DNA$bulk_fam_r)
+
+
+# families found in modern and wild that do not originate from bulk
+setdiff(uniqueASVs.DNA$mod_fam,uniqueASVs.DNA$bulk_fam)
+setdiff(uniqueASVs.DNA$wild_fam,uniqueASVs.DNA$bulk_fam)
+
+
+# get families that have no known origin
+## percentage of unaccounted unique ASVs
+length(setdiff(uniqueASVs.DNA$m_s_filt,uniqueASVs.DNA$mod_seed))/length(uniqueASVs.DNA$m_s_filt) 
+length(setdiff(uniqueASVs.DNA$w_s_filt,uniqueASVs.DNA$wild_seed))/length(uniqueASVs.DNA$w_s_filt)
+
+## unaccounted families
+setdiff(setdiff(uniqueASVs.DNA$mod_fam_s,uniqueASVs.DNA$bulk_fam),uniqueASVs.DNA$mod_seed_fam) # modern
+setdiff(setdiff(uniqueASVs.DNA$wild_fam_s,uniqueASVs.DNA$bulk_fam),uniqueASVs.DNA$wild_seed_fam) # wild 
+
+intersect(setdiff(setdiff(uniqueASVs.DNA$mod_fam_s,uniqueASVs.DNA$bulk_fam_S),uniqueASVs.DNA$mod_seed_fam), setdiff(setdiff(uniqueASVs.DNA$wild_fam_s,uniqueASVs.DNA$bulk_fam_s),uniqueASVs.DNA$wild_seed_fam))
+
+clipr::write_clip(intersect(setdiff(setdiff(uniqueASVs.DNA$mod_fam_s,uniqueASVs.DNA$bulk_fam_s),uniqueASVs.DNA$mod_seed_fam), setdiff(setdiff(uniqueASVs.DNA$wild_fam_s,uniqueASVs.DNA$bulk_fam_s),uniqueASVs.DNA$wild_seed_fam)))
+
+
+```
+
+create venn diagrams
+```{r}
+dir.create("venn")
+
+# venn diagrmas of ASVs found in modern, wild and bulk
+venn.diagram(x=uniqueASVs.DNA[c("m_s","w_s","b_s")],
+             category.names = c("modern" , "wild" , "bulk"),
+             filename = 'venn/DNA_venn_unique_ASVs_spermo.png', 
+             output=TRUE, 
+             fill=brewer.pal(3, "Pastel2"), 
+             cex = 2, cat.cex = 2,disable.logging = T) # spermospehre
+
+venn.diagram(x=uniqueASVs.DNA[c("m_r","w_r","b_r")],
+             category.names = c("modern" , "wild" , "bulk"),
+             filename = 'venn/DNA_venn_unique_ASVs_rhizo.png', 
+             output=TRUE, fill=brewer.pal(3, "Pastel2"), 
+             cex = 2, cat.cex = 2,disable.logging = T) # rhizosphere
+
+
+venn.diagram(x=uniqueASVs.DNA[c("m_s","m_r")],
+             category.names = c("spermosphere" , "rhizosphere"),
+             filename = 'venn/DNA_ASVs_unique_modern_s_r.png', 
+             output=TRUE, fill= c('#fbc29c','#a5ddc2') ,
+             cex = 2, cat.pos = (180), cat.cex = 2,disable.logging = T) # modern preservation of ASVs
+
+venn.diagram(x=uniqueASVs.DNA[c("w_s","w_r")],
+             category.names = c("spermosphere" , "rhizosphere"),
+             filename = 'venn/DNA_ASVs_unique_wild_s_r.png', 
+             output=TRUE,  fill= c('#fbc29c','#a5ddc2') ,
+             cex = 2, cat.pos = (180), cat.cex = 2,disable.logging = T) # wild preservation of ASVs
+
+venn.diagram(x=uniqueASVs.RNA[c("b_s","b_r")],
+             category.names = c("spermosphere" , "rhizosphere"),
+             filename = 'venn/RNA_ASVs_unique_bulk_s_r.png', 
+             output=TRUE,  fill= c('#fbc29c','#a5ddc2') ,
+             cex = 2, cat.pos = (180), cat.cex = 2,disable.logging = T) # bulk preservation of ASVs
+
+
+# family
+venn.diagram(x=lapply(uniqueASVs.DNA[c("mod_fam_s","wild_fam_s","bulk_fam_s")], function(x) x[!is.na(x)]),
+             category.names = c("modern" , "wild" , "bulk"),
+             filename = 'venn/DNA_families_spermo.png', 
+             output=TRUE, fill=brewer.pal(3, "Pastel2"),
+             cex = 2, cat.cex = 2,disable.logging = T) # wild preservation of ASVs
+
+venn.diagram(x=lapply(uniqueASVs.DNA[c("mod_fam_r","wild_fam_r","bulk_fam_r")], function(x) x[!is.na(x)]),
+             category.names = c("modern" , "wild" , "bulk"),
+             filename = 'venn/DNA_families_rhizo.png', 
+             output=TRUE, fill=brewer.pal(3, "Pastel2"),
+             cex = 2, cat.cex = 2,disable.logging = T) # wild preservation of ASVs
+
+
+```
+
+## RNA
+investigate unique effective ASVs in each stage and status RNA
+```{r}
+uniqueASVs.RNA <- list()
+
+# get ASVs found in each condition
+uniqueASVs.RNA$m_s <- rownames(otu_table(ps_filter(RNA.rare$ps.rare,condition=="modern_spermosphere")))
+uniqueASVs.RNA$w_s <- rownames(otu_table(ps_filter(RNA.rare$ps.rare,condition=="wild_spermosphere")))
+uniqueASVs.RNA$b_s <- rownames(otu_table(ps_filter(RNA.rare$ps.rare,condition=="bulk_bulkS")))
+uniqueASVs.RNA$m_r <- rownames(otu_table(ps_filter(RNA.rare$ps.rare,condition=="modern_rhizosphere")))
+uniqueASVs.RNA$w_r <- rownames(otu_table(ps_filter(RNA.rare$ps.rare,condition=="wild_rhizosphere")))
+uniqueASVs.RNA$b_r <- rownames(otu_table(ps_filter(RNA.rare$ps.rare,condition=="bulk_bulkR")))
+
+# filter out ASVs from bulk soil
+uniqueASVs.RNA$m_s_filt <- setdiff(uniqueASVs.RNA$m_s,uniqueASVs.RNA$b_s)
+uniqueASVs.RNA$w_s_filt <- setdiff(uniqueASVs.RNA$w_s,uniqueASVs.RNA$b_s)
+uniqueASVs.RNA$m_r_filt <- setdiff(uniqueASVs.RNA$m_r,uniqueASVs.RNA$b_r)
+uniqueASVs.RNA$w_r_filt <- setdiff(uniqueASVs.RNA$w_r,uniqueASVs.RNA$b_r)
+uniqueASVs.RNA$mod_filt <- setdiff(uniqueASVs.RNA$m_s_filt,uniqueASVs.RNA$w_s)
+uniqueASVs.RNA$wild_filt <- setdiff(uniqueASVs.RNA$w_s_filt,uniqueASVs.RNA$m_s)
+
+## get unique ASVs
+uniqueASVs.RNA$m_s_unique <- setdiff(uniqueASVs.RNA$m_s_filt,uniqueASVs.RNA$w_s)
+uniqueASVs.RNA$w_s_unique <- setdiff(uniqueASVs.RNA$w_s_filt,uniqueASVs.RNA$m_s)
+uniqueASVs.RNA$m_r_unique <- setdiff(uniqueASVs.RNA$m_r_filt,uniqueASVs.RNA$w_r)
+uniqueASVs.RNA$w_r_unique <- setdiff(uniqueASVs.RNA$w_r_filt,uniqueASVs.RNA$m_r)
+
+
+# get families only found in certain statuses
+uniqueASVs.RNA$mod_fam <- unique(as.data.frame(tax_table(ps_filter(RNA.rare$ps.rare,status=="modern")))$Family)
+uniqueASVs.RNA$wild_fam <- unique(as.data.frame(tax_table(ps_filter(RNA.rare$ps.rare,status=="wild")))$Family)
+uniqueASVs.RNA$bulk_fam <- unique(as.data.frame(tax_table(ps_filter(RNA.rare$ps.rare,status=="bulk")))$Family)
+
+
+# get families per condition
+uniqueASVs.RNA$mod_fam_s <- unique(as.data.frame(tax_table(ps_filter(RNA.rare$ps.rare,condition=="modern_spermosphere")))$Family)
+uniqueASVs.RNA$wild_fam_s <- unique(as.data.frame(tax_table(ps_filter(RNA.rare$ps.rare,condition=="wild_spermosphere")))$Family)
+uniqueASVs.RNA$bulk_fam_s <- unique(as.data.frame(tax_table(ps_filter(RNA.rare$ps.rare,condition=="bulk_bulkS")))$Family)
+
+uniqueASVs.RNA$mod_fam_r <- unique(as.data.frame(tax_table(ps_filter(RNA.rare$ps.rare,condition=="modern_rhizosphere")))$Family)
+uniqueASVs.RNA$wild_fam_r <- unique(as.data.frame(tax_table(ps_filter(RNA.rare$ps.rare,condition=="wild_rhizosphere")))$Family)
+uniqueASVs.RNA$bulk_fam_r <- unique(as.data.frame(tax_table(ps_filter(RNA.rare$ps.rare,condition=="bulk_bulkR")))$Family)
+
+
+# get ASVs and families found in seed samples
+uniqueASVs.RNA$mod_seed <- rownames(raw.data$counts.seed[,raw.data$meta.seed$status=="modern"][apply(raw.data$counts.seed[raw.data$meta.seed$status =="wild",],1,function(x) !all(x==0)),])
+uniqueASVs.RNA$wild_seed <- rownames(raw.data$counts.seed[,raw.data$meta.seed$status=="wild"][apply(raw.data$counts.seed[raw.data$meta.seed$status =="modern",],1,function(x) !all(x==0)),])
+uniqueASVs.RNA$mod_seed_fam <- na.omit(RNA$taxa[rownames(RNA$taxa) %in% uniqueASVs.RNA$mod_seed,]$Family)
+uniqueASVs.RNA$wild_seed_fam <- na.omit(RNA$taxa[rownames(RNA$taxa) %in% uniqueASVs.RNA$wild_seed,]$Family)
+
+
+```
+
+```{r}
+
+# get spermosphere to rhizosphere conservation
+length(intersect(uniqueASVs.RNA$m_s,uniqueASVs.RNA$m_r))/length(unique(c(uniqueASVs.RNA$m_s,uniqueASVs.RNA$m_r))) 
+length(intersect(uniqueASVs.RNA$w_s,uniqueASVs.RNA$w_r))/length(unique(c(uniqueASVs.RNA$w_s,uniqueASVs.RNA$w_r)))
+
+## for unique ASVs
+length(intersect(uniqueASVs.RNA$m_s_filt,uniqueASVs.RNA$m_r_filt))/length(unique(c(uniqueASVs.RNA$m_s_filt,uniqueASVs.RNA$m_r_filt))) 
+length(intersect(uniqueASVs.RNA$w_s_filt,uniqueASVs.RNA$w_r_filt))/length(unique(c(uniqueASVs.RNA$w_s_filt,uniqueASVs.RNA$w_r_filt)))
+
+
+## get family counts of unique asvs per status
+uniqueASVs.RNA$mod_fam_count_s <- as.data.frame(sort(table(RNA$taxa[match(setdiff(uniqueASVs.RNA$m_s_filt, uniqueASVs.RNA$w_s_filt),rownames(RNA$taxa)),"Family"]),decreasing = T))
+uniqueASVs.RNA$wild_fam_count_s <- as.data.frame(sort(table(RNA$taxa[match(setdiff(uniqueASVs.RNA$w_s_filt, uniqueASVs.RNA$m_s_filt),rownames(RNA$taxa)),"Family"]),decreasing = T))
+uniqueASVs.RNA$mod_fam_count_r <- as.data.frame(sort(table(RNA$taxa[match(setdiff(uniqueASVs.RNA$m_r_filt, uniqueASVs.RNA$w_r_filt),rownames(RNA$taxa)),"Family"]),decreasing = T))
+uniqueASVs.RNA$wild_fam_count_r <- as.data.frame(sort(table(RNA$taxa[match(setdiff(uniqueASVs.RNA$w_r_filt, uniqueASVs.RNA$m_r_filt),rownames(RNA$taxa)),"Family"]),decreasing = T))
+
+
+# unique families to genotypes in spermosphere compartments
+
+## modern
+setdiff(setdiff(uniqueASVs.RNA$mod_fam_s,uniqueASVs.RNA$wild_fam_s),uniqueASVs.RNA$bulk_fam_s)
+clipr::write_clip(setdiff(setdiff(uniqueASVs.RNA$mod_fam_s,uniqueASVs.RNA$wild_fam_s),uniqueASVs.RNA$bulk_fam_s))
+table(RNA$taxa[rownames(RNA$taxa) %in% uniqueASVs.RNA$m_s_unique,"Family"])[setdiff(setdiff(uniqueASVs.RNA$mod_fam_s,uniqueASVs.RNA$wild_fam_s),uniqueASVs.RNA$bulk_fam_s)]
+
+## wild
+setdiff(setdiff(uniqueASVs.RNA$wild_fam_s,uniqueASVs.RNA$mod_fam_s),uniqueASVs.RNA$bulk_fam_s) 
+clipr::write_clip(setdiff(setdiff(uniqueASVs.RNA$wild_fam_s,uniqueASVs.RNA$mod_fam_s),uniqueASVs.RNA$bulk_fam_s))
+table(RNA$taxa[rownames(RNA$taxa) %in% uniqueASVs.RNA$w_s_unique,"Family"])[setdiff(setdiff(uniqueASVs.RNA$wild_fam_s,uniqueASVs.RNA$mod_fam_s),uniqueASVs.RNA$bulk_fam_s) ]
+
+# unique families to genotypes in rhizosphere compartments
+
+## modern
+setdiff(setdiff(uniqueASVs.RNA$mod_fam_r,uniqueASVs.RNA$wild_fam_r),uniqueASVs.RNA$bulk_fam_r)
+clipr::write_clip(setdiff(setdiff(uniqueASVs.RNA$mod_fam_r,uniqueASVs.RNA$wild_fam_r),uniqueASVs.RNA$bulk_fam_r))
+table(RNA$taxa[rownames(RNA$taxa) %in% uniqueASVs.RNA$m_r_unique,"Family"])[setdiff(setdiff(uniqueASVs.RNA$mod_fam_r,uniqueASVs.RNA$wild_fam_r),uniqueASVs.RNA$bulk_fam_r)]
+
+## wild
+setdiff(setdiff(uniqueASVs.RNA$wild_fam_r,uniqueASVs.RNA$mod_fam_r),uniqueASVs.RNA$bulk_fam_r) 
+clipr::write_clip(setdiff(setdiff(uniqueASVs.RNA$wild_fam_r,uniqueASVs.RNA$mod_fam_r),uniqueASVs.RNA$bulk_fam_r))
+table(RNA$taxa[rownames(RNA$taxa) %in% uniqueASVs.RNA$w_r_unique,"Family"])[setdiff(setdiff(uniqueASVs.RNA$wild_fam_r,uniqueASVs.RNA$mod_fam_r),uniqueASVs.RNA$bulk_fam_r) ]
+
+
+clipr::write_clip()
+
+
+```
+
+create venn diagrams
+```{r}
+
+# venn diagrmas of ASVs found in modern, wild and bulk
+venn.diagram(x=uniqueASVs.RNA[c("m_s","w_s","b_s")],
+             category.names = c("modern" , "wild" , "bulk"),
+             filename = 'venn/RNA_venn_unique_ASVs_spermo.png', 
+             output=TRUE, 
+             fill=brewer.pal(3, "Pastel2"), 
+             cex = 2, cat.cex = 2,disable.logging = T) # spermospehre
+
+venn.diagram(x=uniqueASVs.RNA[c("m_r","w_r","b_r")],
+             category.names = c("modern" , "wild" , "bulk"),
+             filename = 'venn/RNA_venn_unique_ASVs_rhizo.png', 
+             output=TRUE, fill=brewer.pal(3, "Pastel2"), 
+             cex = 2, cat.cex = 2,disable.logging = T) # rhizosphere
+
+
+venn.diagram(x=uniqueASVs.RNA[c("m_s","m_r")],
+             category.names = c("spermosphere" , "rhizosphere"),
+             filename = 'venn/RNA_unique_ASVs_modern_s_r.png', 
+             output=TRUE, fill= c('#fbc29c','#a5ddc2') ,
+             cex = 2, cat.pos = (180), cat.cex = 2,disable.logging = T) # modern preservation of ASVs
+
+
+venn.diagram(x=uniqueASVs.RNA[c("w_s","w_r")],
+             category.names = c("spermosphere" , "rhizosphere"),
+             filename = 'venn/RNA_unique_ASVs_wild_s_r.png', 
+             output=TRUE, fill= c('#fbc29c','#a5ddc2') ,
+             cex = 2, cat.pos = (180), cat.cex = 2,disable.logging = T) # wild preservation of ASVs
+
+
+venn.diagram(x=uniqueASVs.RNA[c("b_s","b_r")],
+             category.names = c("spermosphere" , "rhizosphere"),
+             filename = 'venn/RNA_unique_ASVs_bulk_s_r.png', 
+             output=TRUE, fill= c('#fbc29c','#a5ddc2') ,
+             cex = 2, cat.pos = (180), cat.cex = 2,disable.logging = T) # bulk preservation of ASVs
+
+
+# family
+venn.diagram(x=lapply(uniqueASVs.RNA[c("mod_fam_s","wild_fam_s","bulk_fam_s")], function(x) x[!is.na(x)]),
+             category.names = c("modern" , "wild" , "bulk"),
+             filename = 'venn/RNA_families_spermo.png', 
+             output=TRUE, fill=brewer.pal(3, "Pastel2"),
+             cex = 2, cat.cex = 2,disable.logging = T) # wild preservation of ASVs
+
+venn.diagram(x=lapply(uniqueASVs.RNA[c("mod_fam_r","wild_fam_r","bulk_fam_r")], function(x) x[!is.na(x)]),
+             category.names = c("modern" , "wild" , "bulk"),
+             filename = 'venn/RNA_families_rhizo.png', 
+             output=TRUE, fill=brewer.pal(3, "Pastel2"),
+             cex = 2, cat.cex = 2,disable.logging = T) # wild preservation of ASVs
+
+```
+
+
+#
+# differential abundance analysis ----------------------------------------------
+
+calculate fold changes
+```{r}
+## calculate fold change spermosphere vs rhizosphere , no intercept
+variables$contrasts <- c("Cmodern_rhizosphere-Cmodern_spermosphere",   
+                         "Cwild_rhizosphere-Cwild_spermosphere",
+                         "Cbulk_bulkR-Cbulk_bulkS",
+                         "Cmodern_rhizosphere-Cwild_rhizosphere",
+                         "Cmodern_rhizosphere-Cbulk_bulkR",
+                         "Cbulk_bulkR-Cwild_rhizosphere",
+                         "Cmodern_spermosphere-Cwild_spermosphere",
+                         "Cmodern_spermosphere-Cbulk_bulkS",
+                         "Cbulk_bulkS-Cwild_spermosphere"
+                         )
+
+
+dir.create("contrasts")
+dir.create("differential_ASVs")
+DNA.FC <- calculate.FC(DNA.EF$obj,variables$contrasts,0.1,0.5)
+RNA.FC <- calculate.FC(RNA.EF$obj,variables$contrasts,0.1,0.5)
+
+```
+
+## create venn diagrams of differentially abundant ASVs
+```{r}
+
+venn <- list()
+FCs <- list()
+result_venn <- list()
+plot <- list()
+
+```
+
+### for DNA
+```{r}
+# get ASVs up and down
+FCs$DNA$modern_spermo_DNA <- DNA.FC[["filt"]][["Cmodern_rhizosphere-Cmodern_spermosphere"]] %>% filter(logFC<0)
+FCs$DNA$wild_spermo_DNA <- DNA.FC[["filt"]][["Cwild_rhizosphere-Cwild_spermosphere"]] %>% filter(logFC<0)
+FCs$DNA$bulk_spermo_DNA <- DNA.FC[["filt"]][["Cbulk_bulkR-Cbulk_bulkS"]] %>% filter(logFC<0)
+FCs$DNA$modern_rhizo_DNA <- DNA.FC[["filt"]][["Cmodern_rhizosphere-Cmodern_spermosphere"]] %>% filter(logFC>0)
+FCs$DNA$wild_rhizo_DNA <- DNA.FC[["filt"]][["Cwild_rhizosphere-Cwild_spermosphere"]] %>% filter(logFC>0)
+FCs$DNA$bulk_rhizo_DNA <- DNA.FC[["filt"]][["Cbulk_bulkR-Cbulk_bulkS"]] %>% filter(logFC>0)
+FCs$DNA$rhizo_wild_DNA <- DNA.FC[["filt"]][["Cmodern_rhizosphere-Cwild_rhizosphere"]] %>% filter(logFC<0)
+FCs$DNA$rhizo_modern_DNA <- DNA.FC[["filt"]][["Cmodern_rhizosphere-Cwild_rhizosphere"]] %>% filter(logFC>0)
+FCs$DNA$spermo_wild_DNA <- DNA.FC[["filt"]][["Cmodern_spermosphere-Cwild_spermosphere"]] %>% filter(logFC<0)
+FCs$DNA$spermo_modern_DNA <- DNA.FC[["filt"]][["Cmodern_spermosphere-Cwild_spermosphere"]] %>% filter(logFC>0)
+
+for(i in names(FCs$DNA)){
+  venn[[i]] <- rownames(FCs$DNA[[i]])
+}
+
+# create venn diagrams
+venn.diagram(x=list(venn$modern_spermo_DNA, venn$wild_spermo_DNA ,venn$bulk_spermo_DNA),
+             category.names = c("modern" , "wild" , "bulk"),
+             filename = 'differential_ASVs/logfc_venn_spermo_DNA.png', 
+             utput=TRUE,fill=c('#ab00c6','#009ac7','#ddff80'),
+             cex = 2, cat.cex = 2,disable.logging = T)
+
+venn.diagram(x=list(venn$modern_rhizo_DNA, venn$wild_rhizo_DNA ,venn$bulk_rhizo_DNA),
+             category.names = c("modern" , "wild" , "bulk"),
+             filename = 'differential_ASVs/logfc_venn_rhizo_DNA.png', 
+             output=TRUE,fill=c('#ab00c6','#009ac7','#ddff80'),
+             cex = 2, cat.cex = 2,disable.logging = T)
+
+venn.diagram(x=list(venn$spermo_wild_DNA, venn$rhizo_wild_DNA),
+             category.names = c("spermosphere" , "rhizosphere"), 
+             filename = 'differential_ASVs/logfc_venn_wild_DNA.png', output=TRUE, 
+             fill= c('#fbc29c','#a5ddc2'), alpha = 0.43, cat.pos = (180), 
+             cex = 2, cat.cex = 2,disable.logging = T)
+
+venn.diagram(x=list(venn$spermo_modern_DNA, venn$rhizo_modern_DNA),
+             category.names = c("spermosphere" , "rhizosphere"),
+             filename = 'differential_ASVs/logfc_venn_modern_DNA.png', 
+             output=TRUE,fill= c('#fbc29c','#a5ddc2'),alpha = 0.43,cat.pos = (180),  
+             cex = 2, cat.cex = 2,disable.logging = T)
+
+
+```
+
+get logFC for ASVs of interest
+```{r}
+## obtain ASVs of interest
+result_venn$overlap_spermo_DNA <- setdiff(intersect(venn$modern_spermo_DNA, venn$wild_spermo_DNA), venn$bulk_spermo_DNA)
+result_venn$modern_spermo_DNA <- setdiff(setdiff(venn$modern_spermo_DNA, venn$wild_spermo_DNA), venn$bulk_spermo_DNA)
+result_venn$wild_spermo_DNA <- setdiff(setdiff(venn$wild_spermo_DNA, venn$modern_spermo_DNA), venn$bulk_spermo_DNA)
+result_venn$overlap_rhizo_DNA <- setdiff(intersect(venn$modern_rhizo_DNA, venn$wild_rhizo_DNA), venn$bulk_rhizo_DNA)
+result_venn$modern_rhizo_DNA <- setdiff(setdiff(venn$modern_rhizo_DNA, venn$wild_rhizo_DNA), venn$bulk_rhizo_DNA)
+result_venn$wild_rhizo_DNA <- setdiff(setdiff(venn$wild_rhizo_DNA, venn$modern_rhizo_DNA), venn$bulk_rhizo_DNA)
+result_venn$overlap_stage_DNA <- c(intersect(venn$spermo_modern_DNA, venn$rhizo_modern_DNA),intersect(venn$spermo_wild_DNA,venn$rhizo_wild_DNA))
+result_venn$spermo_DNA <- setdiff(c(venn$spermo_modern_DNA, venn$spermo_wild_DNA),result_venn$overlap_stage_DNA)
+result_venn$rhizo_DNA <- setdiff(c(venn$rhizo_modern_DNA, venn$rhizo_wild_DNA),result_venn$overlap_stage_DNA)
+
+## ASVs of interest extended with taxonomy
+plot$overlap_DNA <- get_tax(DNA.FC[["filt"]][["Cmodern_rhizosphere-Cmodern_spermosphere"]], DNA[["taxa"]],c(result_venn$overlap_spermo_DNA,result_venn$overlap_rhizo_DNA), "spermosphere","rhizosphere") # overlap
+plot$modern_DNA <- get_tax(DNA.FC[["filt"]][["Cmodern_rhizosphere-Cmodern_spermosphere"]], DNA[["taxa"]],c(result_venn$modern_spermo_DNA,result_venn$modern_rhizo_DNA), "spermosphere","rhizosphere") # modern
+plot$wild_DNA <- get_tax(DNA.FC[["filt"]][["Cwild_rhizosphere-Cwild_spermosphere"]], DNA[["taxa"]],c(result_venn$wild_spermo_DNA,result_venn$wild_rhizo_DNA), "spermosphere","rhizosphere") # wild
+plot$overlap_stage_DNA <- get_tax(DNA.FC[["filt"]][["Cmodern_spermosphere-Cwild_spermosphere"]],DNA[["taxa"]],result_venn$overlap_stage_DNA, "wild", "modern") 
+plot$spermo_DNA <- get_tax(DNA.FC[["filt"]][["Cmodern_spermosphere-Cwild_spermosphere"]],DNA[["taxa"]],result_venn$spermo_DNA, "wild", "modern") 
+plot$rhizo_DNA <- get_tax(DNA.FC[["filt"]][["Cmodern_rhizosphere-Cwild_rhizosphere"]],DNA[["taxa"]],result_venn$rhizo_DNA, "wild", "modern")
+
+```
+
+barplots
+```{r}
+## plots
+plot_phyla(plot$overlap_DNA, "Overlap modern and wild") #overlap
+plot_zoom(plot$overlap_DNA,"Proteobacteria", "Overlap modern and wild, Proteobacteria") #overlap - proteobacteria
+plot_zoom(plot$overlap_DNA,"Bacteroidota", "Overlap modern and wild, Bacteroidota") #overlap - proteobacteria
+plot_phyla(plot$modern_DNA,"Modern specific") #modern
+plot_zoom(plot$modern_DNA,"Proteobacteria", "Modern specific - Proteobactera") #modern - proteobacteria
+plot_zoom(plot$modern_DNA,"Acidobacteriota", "Modern specific - Acidobacteriota") #modern - proteobacteria
+plot_phyla(plot$wild_DNA, "Wild specific") #wild
+plot_phyla(plot$overlap_stage_DNA,"genotype specific - both stages") #overlap stages
+plot_phyla(plot$spermo_DNA,"spermosphere specific") #spermosphere
+plot_phyla(plot$rhizo_DNA,"rhizosphere specific")  #rhizosphere
+```
+
+### for RNA
+```{r}
+## get ASVs up and down
+FCs$RNA$modern_spermo_RNA <- RNA.FC[["filt"]][["Cmodern_rhizosphere-Cmodern_spermosphere"]] %>% filter(logFC<0)
+FCs$RNA$wild_spermo_RNA <- RNA.FC[["filt"]][["Cwild_rhizosphere-Cwild_spermosphere"]] %>% filter(logFC<0)
+FCs$RNA$bulk_spermo_RNA <- RNA.FC[["filt"]][["Cbulk_bulkR-Cbulk_bulkS"]] %>% filter(logFC<0)
+FCs$RNA$modern_rhizo_RNA <- RNA.FC[["filt"]][["Cmodern_rhizosphere-Cmodern_spermosphere"]] %>% filter(logFC>0)
+FCs$RNA$wild_rhizo_RNA <- RNA.FC[["filt"]][["Cwild_rhizosphere-Cwild_spermosphere"]] %>% filter(logFC>0)
+FCs$RNA$bulk_rhizo_RNA <- RNA.FC[["filt"]][["Cbulk_bulkR-Cbulk_bulkS"]] %>% filter(logFC>0)
+FCs$RNA$rhizo_wild_RNA <- RNA.FC[["filt"]][["Cmodern_rhizosphere-Cwild_rhizosphere"]] %>% filter(logFC<0)
+FCs$RNA$rhizo_modern_RNA <- RNA.FC[["filt"]][["Cmodern_rhizosphere-Cwild_rhizosphere"]] %>% filter(logFC>0)
+FCs$RNA$spermo_wild_RNA <- RNA.FC[["filt"]][["Cmodern_spermosphere-Cwild_spermosphere"]] %>% filter(logFC<0)
+FCs$RNA$spermo_modern_RNA <- RNA.FC[["filt"]][["Cmodern_spermosphere-Cwild_spermosphere"]] %>% filter(logFC>0)
+
+for(i in names(FCs$RNA)){
+  venn[[i]] <- rownames(FCs$RNA[[i]])
+}
+
+## create venn diagrams
+venn.diagram(x=list(venn$modern_spermo_RNA, venn$wild_spermo_RNA ,venn$bulk_spermo_RNA),
+             category.names = c("modern" , "wild" , "bulk"),
+             filename = 'differential_ASVs/logfc_venn_spermo_RNA.png', 
+             output=TRUE,fill=c('#ab00c6','#009ac7','#ddff80'), 
+             cex = 2, cat.cex = 2,disable.logging = T)
+venn.diagram(x=list(venn$modern_rhizo_RNA, venn$wild_rhizo_RNA ,venn$bulk_rhizo_RNA),
+             category.names = c("modern" , "wild" , "bulk"),
+             filename = 'differential_ASVs/logfc_venn_rhizo_RNA.png', 
+             output=TRUE,fill=c('#ab00c6','#009ac7','#ddff80'), 
+             cex = 2, cat.cex = 2,disable.logging = T)
+venn.diagram(x=list(venn$spermo_wild_RNA, venn$rhizo_wild_RNA),
+             category.names = c("spermosphere" , "rhizosphere"),
+             filename = 'differential_ASVs/logfc_venn_wild_RNA.png', output=TRUE,
+             fill= c('#fbc29c','#a5ddc2'),alpha = 0.43, cat.pos = (180), 
+             cex = 2, cat.cex = 2,disable.logging = T)
+venn.diagram(x=list(venn$spermo_modern_RNA, venn$rhizo_modern_RNA),
+             category.names = c("spermosphere" , "rhizosphere"),
+             filename = 'differential_ASVs/logfc_venn_modern_RNA.png',  
+             output=TRUE,fill= c('#fbc29c','#a5ddc2'),alpha = 0.43,cat.pos = (180), 
+             cex = 2, cat.cex = 2,disable.logging = T)
+
+
+```
+
+plot logFC for ASVs of interest
+```{r}
+## obtain ASVs of interest
+result_venn$overlap_spermo_RNA <- setdiff(intersect(venn$modern_spermo_RNA, venn$wild_spermo_RNA), venn$bulk_spermo_RNA)
+result_venn$modern_spermo_RNA <- setdiff(setdiff(venn$modern_spermo_RNA, venn$wild_spermo_RNA), venn$bulk_spermo_RNA)
+result_venn$wild_spermo_RNA <- setdiff(setdiff(venn$wild_spermo_RNA, venn$modern_spermo_RNA), venn$bulk_spermo_RNA)
+result_venn$overlap_rhizo_RNA <- setdiff(intersect(venn$modern_rhizo_RNA, venn$wild_rhizo_RNA), venn$bulk_rhizo_RNA)
+result_venn$modern_rhizo_RNA <- setdiff(setdiff(venn$modern_rhizo_RNA, venn$wild_rhizo_RNA), venn$bulk_rhizo_RNA)
+result_venn$wild_rhizo_RNA <- setdiff(setdiff(venn$wild_rhizo_RNA, venn$modern_rhizo_RNA), venn$bulk_rhizo_RNA)
+result_venn$overlap_stage_RNA <- c(intersect(venn$spermo_modern_RNA, venn$rhizo_modern_RNA),intersect(venn$spermo_wild_RNA,venn$rhizo_wild_RNA))
+result_venn$spermo_RNA <- setdiff(c(venn$spermo_modern_RNA, venn$spermo_wild_RNA),result_venn$overlap_stage_RNA)
+result_venn$rhizo_RNA <- setdiff(c(venn$rhizo_modern_RNA, venn$rhizo_wild_RNA),result_venn$overlap_stage_RNA)
+
+## ASVs of interest extended with taxonomy
+plot$overlap_RNA <- get_tax(RNA.FC[["filt"]][["Cmodern_rhizosphere-Cmodern_spermosphere"]], RNA[["taxa"]],c(result_venn$overlap_spermo_RNA,result_venn$overlap_rhizo_RNA), "spermosphere","rhizosphere") # overlap
+plot$modern_RNA <- get_tax(RNA.FC[["filt"]][["Cmodern_rhizosphere-Cmodern_spermosphere"]], RNA[["taxa"]],c(result_venn$modern_spermo_RNA,result_venn$modern_rhizo_RNA), "spermosphere","rhizosphere") # modern
+plot$wild_RNA <- get_tax(RNA.FC[["filt"]][["Cwild_rhizosphere-Cwild_spermosphere"]], RNA[["taxa"]],c(result_venn$wild_spermo_RNA,result_venn$wild_rhizo_RNA),"spermosphere","rhizosphere") # wild
+plot$overlap_stage_RNA <- get_tax(RNA.FC[["filt"]][["Cmodern_spermosphere-Cwild_spermosphere"]],RNA[["taxa"]],result_venn$overlap_stage_RNA, "wild", "modern") 
+plot$spermo_RNA <- get_tax(RNA.FC[["filt"]][["Cmodern_spermosphere-Cwild_spermosphere"]],RNA[["taxa"]],result_venn$spermo_RNA, "wild", "modern") 
+plot$rhizo_RNA <- get_tax(RNA.FC[["filt"]][["Cmodern_rhizosphere-Cwild_rhizosphere"]],RNA[["taxa"]],result_venn$rhizo_RNA, "wild", "modern")
+```
+
+barplots
+```{r}
+## plots
+plot_phyla(plot$overlap_RNA, "Overlap modern and wild") #overlap
+plot_zoom(plot$overlap_RNA,"Proteobacteria", "Overlap modern and wild, Proteobacteria") #overlap - proteobacteria
+plot_zoom(plot$overlap_RNA,"Bacteroidota", "Overlap modern and wild, Bacteroidota") #overlap - proteobacteria
+plot_phyla(plot$modern_RNA,"Modern specific") #modern
+plot_phyla(plot$wild_RNA, "Wild specific") #wild
+plot_phyla(plot$overlap_stage_RNA,"genotype specific - both stages") #overlap stages
+plot_phyla(plot$spermo_RNA,"spermosphere specific") #spermosphere
+plot_phyla(plot$rhizo_RNA,"rhizosphere specific")  #rhizosphere
+
+```
+
+## export tables
+get fold change tables by venn compartment (TABLES) 
+```{r}
+names <- c("modern_spermo_DNA","wild_spermo_DNA","modern_rhizo_DNA","wild_rhizo_DNA")
+export_diff(DNA, names, FCs$DNA, "DNA", result_venn, F)
+names <- c("modern_spermo_RNA","wild_spermo_RNA","modern_rhizo_RNA","wild_rhizo_RNA")
+export_diff(RNA, names, FCs$RNA, "RNA", result_venn, F)
+
+```
+
+
+## iTOL
+write logFC txt files for tree creation in iTOL
+```{r}
+dir.create("logFC")
+write.table(plot$overlap_DNA[,c("asv","logFC")],paste0("logFC/logFC_overlap_DNA.txt"),row.names = F)
+write.table(plot$modern_DNA[,c("asv","logFC")],paste0("logFC/logFC_modern_DNA.txt"),row.names = F)
+write.table(plot$wild_DNA[,c("asv","logFC")],paste0("logFC/logFC_wild_DNA.txt"),row.names = F)
+
+write.table(plot$overlap_RNA[,c("asv","logFC")],paste0("logFC/logFC_overlap_RNA.txt"),row.names = F)
+write.table(plot$modern_RNA[,c("asv","logFC")],paste0("logFC/logFC_modern_RNA.txt"),row.names = F)
+write.table(plot$wild_RNA[,c("asv","logFC")],paste0("logFC/logFC_wild_RNA.txt"),row.names = F)
+```
+
+
+## additional barplots
+bar plots of differentially abundant Family sum aggregated ASVs
+```{r}
+##################################### DNA #####################################
+DNA.FC.bars <- create.bar(DNA.FC$agg)
+for(i in names(DNA.FC.bars)){
+  X11()
+  plot(DNA.FC.bars[[i]] + ggtitle(paste0(i," DNA")))
+}
+
+##################################### RNA #####################################
+RNA.FC.bars <- create.bar(RNA.FC$agg)
+for(i in names(RNA.FC.bars)){
+  print(i)
+  X11()
+  plot(RNA.FC.bars[[i]]+ ggtitle(paste0(i," RNA")))
+}
+```
+
+barplots of modern/wild contrasts
+```{r}
+##########################
+a<- DNA.FC$agg$`Cmodern_rhizosphere-Cwild_rhizosphere`[,c("logFC","Family","Phylum")] %>% mutate(stage="rhizosphere")
+a <- rbind(a, DNA.FC$agg$`Cmodern_spermosphere-Cwild_spermosphere`[,c("logFC","Family","Phylum")] %>% mutate(stage="spermosphere"))
+
+a$Phylum <- factor(a$Phylum,levels=unique(a$Phylum))
+
+x11()
+ggplot(data=drop_na(a), aes(x=Family, y=logFC, fill=Phylum)) + 
+  geom_bar(stat="identity", position=position_dodge(), width = 0.75) + 
+  labs(title="moden / wild DNA") + 
+  facet_grid(rows = c(vars(stage),vars(Phylum)), scales = "free_y", space = "free_y",switch = "y") + 
+  theme(strip.placement = "outside", strip.background = element_rect(fill = "white"), axis.title = element_blank()) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + coord_flip()
+
+
+###############
+
+a<- RNA.FC$agg$`Cmodern_rhizosphere-Cwild_rhizosphere`[,c("logFC","Family","Phylum")] %>% mutate(stage="rhizosphere")
+a <- rbind(a, RNA.FC$agg$`Cmodern_spermosphere-Cwild_spermosphere`[,c("logFC","Family","Phylum")] %>% mutate(stage="spermosphere"))
+
+a$Phylum <- factor(a$Phylum,levels=unique(a$Phylum))
+
+x11()
+ggplot(data=drop_na(a), aes(x=Family, y=logFC, fill=Phylum)) + 
+  geom_bar(stat="identity", position=position_dodge(), width = 0.75) + 
+  labs(title= "moden / wild RNA") + 
+  facet_grid(rows = c(vars(stage),vars(Phylum)), scales = "free_y", space = "free_y",switch = "y") + 
+  theme(strip.placement = "outside", strip.background = element_rect(fill = "white"), axis.title = element_blank()) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + coord_flip()
+
+```
+#
+#
+#
+#
+#
+# clammtest --------------------------------------------------------------------
+
+UNUSED!
+
+##DNA
+```{r}
+otu <- t(DNA$counts)
+env <- DNA$meta
+tax <- DNA$taxa
+solutions <- list()
+```
+
+```{r}
+
+otu <- t(RNA$counts)
+env <- RNA$meta
+tax <- RNA$taxa
+solutions <- list()
+
+```
+
+```{r}
+#spermo vs rhizo modern
+samples <- env[env$condition=="modern_rhizosphere" | env$condition == "modern_spermosphere",]
+asv <- otu[rownames(otu) %in% rownames(samples),]
+asv = asv[,colSums(asv) >= 1]       #para remover as colunas de OTUs que somam 0
+sol <- with(samples, clamtest(asv, condition, alpha = 0.005))
+X11()
+plot(sol,  pch = 15:18, col = c("#cccccc", "#438b52", "#f3b06e", "#252525"),  cex = 1.2, col.lines = c("#4d4d4d","#4d4d4d","#4d4d4d"), lty = 1:3, lwd = 2,position="NA")
+
+solutions$modernspermo <- sol[sol$Classes=="Specialist_modern_spermosphere",]$Species
+solutions$modernspermo <- tax[rownames(tax) %in% solutions$modernspermo,]
+solutions$modernrhizo <- sol[sol$Classes=="Specialist_modern_rhizosphere",]$Species
+solutions$modernrhizo <- tax[rownames(tax) %in% solutions$modernrhizo,]
+X11()
+barchart(solutions$modernrhizo$Phylum, col = "#f3b06e")
+X11()
+barchart(solutions$modernspermo$Phylum, col = "#438b52")
+
+
+#spermo vs rhizo wild
+samples <- env[env$condition=="wild_rhizosphere" | env$condition == "wild_spermosphere",]
+asv <- otu[rownames(otu) %in% rownames(samples),]
+asv = asv[,colSums(asv) >= 1]       #para remover as colunas de OTUs que somam 0
+sol <- with(samples, clamtest(asv, condition, alpha = 0.005))
+plot(sol,  pch = 15:18, col = c("#cccccc", "#438b52", "#f3b06e", "#252525"),  cex = 1.2, col.lines = c("#4d4d4d","#4d4d4d","#4d4d4d"), lty = 1:3, lwd = 2, position = "NA")
+
+solutions$wildspermo <- sol[sol$Classes=="Specialist_wild_spermosphere",]$Species
+solutions$wildspermo <- tax[rownames(tax) %in% solutions$wildspermo,]
+solutions$wildrhizo <- sol[sol$Classes=="Specialist_wild_rhizosphere",]$Species
+solutions$wildrhizo <- tax[rownames(tax) %in% solutions$wildrhizo,]
+X11()
+barchart(solutions$wildrhizo$Phylum, col = "#f3b06e")
+X11()
+barchart(solutions$wildspermo$Phylum, col = "#438b52")
+
+
+#spermo vs rhizo bulk
+samples <- env[env$condition=="bulk_bulkR" | env$condition == "bulk_bulkS",]
+asv <- otu[rownames(otu) %in% rownames(samples),]
+asv = asv[,colSums(asv) >= 1]       #para remover as colunas de OTUs que somam 0
+sol <- with(samples, clamtest(asv, condition, alpha = 0.005))
+x11()
+plot(sol,  pch = 15:18, col = c("#cccccc", "#438b52", "#f3b06e", "#252525"),  cex = 1.2, col.lines = c("#4d4d4d","#4d4d4d","#4d4d4d"), lty = 1:3, lwd = 2, position = "NA")
+
+
+solutions$bulkspermo <- sol[sol$Classes=="Specialist_bulk_bulkS",]$Species
+solutions$bulkspermo <- tax[rownames(tax) %in% solutions$bulkspermo,]
+solutions$bulkrhizo <- sol[sol$Classes=="Specialist_bulk_bulkR",]$Species
+solutions$bulkrhizo <- tax[rownames(tax) %in% solutions$bulkrhizo,]
+X11()
+barchart(solutions$bulkrhizo$Phylum, col = "#f3b06e")
+X11()
+barchart(solutions$bulkspermo$Phylum, col = "#438b52")
+
+venn <- list()
+
+#venn rhizo
+venn$rhizo_modern <- rownames(solutions$modernrhizo)
+venn$rhizo_wild <- rownames(solutions$wildrhizo)
+venn$rhizo_bulk <- rownames(solutions$bulkrhizo)
+
+a<- venn.diagram(x=list(venn$rhizo_modern,venn$rhizo_wild ,venn$rhizo_bulk),category.names = c("modern" , "wild" , "bulk"),filename = 'venn_rhizo.png',
+             output=TRUE,fill=brewer.pal(3, "Pastel2"))
+
+#venn spermo
+venn$spermo_modern <- rownames(solutions$modernspermo)
+venn$spermo_wild <- rownames(solutions$wildspermo)
+venn$spermo_bulk <- rownames(solutions$bulkspermo)
+
+
+venn.diagram(x=list(venn$spermo_modern,venn$spermo_wild ,venn$spermo_bulk),category.names = c("modern" , "wild" , "bulk"),filename = 'venn_spermo.png',
+             output=TRUE,fill=brewer.pal(3, "Pastel2"))
+
+
+
+#mod vs wild spermo
+samples <- env[env$condition=="wild_spermosphere" | env$condition == "modern_spermosphere",]
+asv <- otu[rownames(otu) %in% rownames(samples),]
+asv = asv[,colSums(asv) >= 1]       #para remover as colunas de OTUs que somam 0
+sol <- with(samples, clamtest(asv, condition, alpha = 0.005))
+plot(sol,  pch = 15:18, col = c("#cccccc", "#438b52", "#f3b06e", "#252525"),  cex = 1.2, col.lines = c("#4d4d4d","#4d4d4d","#4d4d4d"), lty = 1:3, lwd = 2, position = "NA")
+solutions$spermowild <- sol[sol$Classes=="Specialist_wild_spermosphere",]$Species
+solutions$spermowild <- tax[rownames(tax) %in% solutions$spermowild,]
+solutions$spermomod <- sol[sol$Classes=="Specialist_modern_spermosphere",]$Species
+solutions$spermomod <- tax[rownames(tax) %in% solutions$spermomod,]
+X11()
+barchart(solutions$spermomod$Phylum, col = "#f3b06e")
+X11()
+barchart(solutions$spermowild$Phylum, col = "#438b52")
+
+
+#mod vs wild rhizosphere
+samples <- env[env$condition=="wild_rhizosphere" | env$condition == "modern_rhizosphere",]
+asv <- otu[rownames(otu) %in% rownames(samples),]
+asv = asv[,colSums(asv) >= 1]       #para remover as colunas de OTUs que somam 0
+sol <- with(samples, clamtest(asv, condition, alpha = 0.005))
+plot(sol,  pch = 15:18, col = c("#cccccc", "#438b52", "#f3b06e", "#252525"),  cex = 1.2, col.lines = c("#4d4d4d","#4d4d4d","#4d4d4d"), lty = 1:3, lwd = 2, position = "NA")
+solutions$rhizowild <- sol[sol$Classes=="Specialist_wild_rhizosphere",]$Species
+solutions$rhizowild <- tax[rownames(tax) %in% solutions$rhizowild,]
+solutions$rhizomod <- sol[sol$Classes=="Specialist_modern_rhizosphere",]$Species
+solutions$rhizomod <- tax[rownames(tax) %in% solutions$rhizomod,]
+X11()
+barchart(solutions$rhizomod$Phylum, col = "#f3b06e")
+X11()
+barchart(solutions$rhizowild$Phylum, col = "#438b52")
+
+
+#venn mod
+venn$spermomod <- rownames(solutions$spermomod)
+venn$rhizomod<- rownames(solutions$rhizomod)
+venn.diagram(x=list(venn$spermomod,venn$rhizomod),category.names = c("spermosphere" , "rhizosphere"),filename = 'venn_mod.png',
+             output=TRUE)
+
+#venn wild
+venn$spermowild <- rownames(solutions$spermowild)
+venn$rhizowild<- rownames(solutions$rhizowild)
+a <- venn.diagram(x=list(venn$spermowild,venn$rhizowild),category.names = c("spermosphere" , "rhizosphere"),filename = 'venn_wild.png',
+             output=TRUE)
+
+#DNA$clamm <- solutions
+
+RNA$clamm <- solutions
+
+
+```
+
+
+
